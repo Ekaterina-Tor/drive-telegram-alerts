@@ -44,15 +44,25 @@ function escapeHtml(text = "") {
 }
 
 async function sendTelegram(message) {
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      chat_id: TELEGRAM_CHAT_ID,
-      text: message,
-      parse_mode: "HTML",
-      disable_web_page_preview: false
+  const chatIds = process.env.TELEGRAM_CHAT_IDS
+    ? process.env.TELEGRAM_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean)
+    : [process.env.TELEGRAM_CHAT_ID];
+
+  for (const chatId of chatIds) {
+    try {
+      await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          chat_id: chatId,
+          text: message,
+          parse_mode: "HTML",
+          disable_web_page_preview: false
+        }
+      );
+    } catch (error) {
+      console.error(`Telegram send error for ${chatId}:`, error.response?.data || error.message);
     }
-  );
+  }
 }
 
 function detectChange(file, previous, removed) {
