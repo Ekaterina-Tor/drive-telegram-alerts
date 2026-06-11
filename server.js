@@ -18,6 +18,7 @@ const {
   TELEGRAM_CHAT_IDS,
   PUBLIC_WEBHOOK_URL,
   GOOGLE_CHANNEL_TOKEN,
+  TARGET_FOLDER_ID,
   PORT
 } = process.env;
 
@@ -148,7 +149,7 @@ async function processDriveChanges() {
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
         fields:
-          "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed))"
+          "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed,parents))"
       });
 
       for (const change of res.data.changes || []) {
@@ -173,6 +174,14 @@ async function processDriveChanges() {
           console.log("Folder ignored:", file.name);
           continue;
         }
+
+        if (
+    TARGET_FOLDER_ID &&
+    (!file.parents || !file.parents.includes(TARGET_FOLDER_ID))
+  ) {
+    console.log("Outside target folder ignored:", file.name);
+    continue;
+  }
 
         const eventKey = `${file.id}:${file.modifiedTime}:${file.trashed}`;
 
