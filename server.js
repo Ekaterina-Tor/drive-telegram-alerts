@@ -15,7 +15,9 @@ const {
   GOOGLE_REFRESH_TOKEN,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
+  TELEGRAM_CHAT_IDS,
   PUBLIC_WEBHOOK_URL,
+  GOOGLE_CHANNEL_TOKEN,
   PORT
 } = process.env;
 
@@ -31,7 +33,17 @@ oauth2Client.setCredentials({
 const drive = google.drive({ version: "v3", auth: oauth2Client });
 
 let pageToken = null;
-const knownFiles = new Map();
+let isProcessing = false;
+
+const processedEvents = new Set();
+
+function rememberEvent(key) {
+  processedEvents.add(key);
+
+  setTimeout(() => {
+    processedEvents.delete(key);
+  }, 24 * 60 * 60 * 1000);
+}
 
 function escapeHtml(text = "") {
   return String(text).replace(/[&<>"']/g, (c) => ({
@@ -43,12 +55,19 @@ function escapeHtml(text = "") {
   })[c]);
 }
 
-async function sendTelegram(message) {
-  const chatIds = process.env.TELEGRAM_CHAT_IDS
-    ? process.env.TELEGRAM_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean)
-    : [process.env.TELEGRAM_CHAT_ID];
+function getTelegramChatIds() {
+  if (TELEGRAM_CHAT_IDS) {
+    return TELEGRAM_CHAT_IDS
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+  }
 
-  for (const chatId of chatIds) {
+  return [TELEGRAM_CHAT_ID].filter(Boolean);
+}
+
+async function sendTelegram(message) {
+  for (const chatId of getTelegramChatIds()) {
     try {
       await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -60,30 +79,26 @@ async function sendTelegram(message) {
         }
       );
     } catch (error) {
-      console.error(`Telegram send error for ${chatId}:`, error.response?.data || error.message);
+      console.error(
+        `Telegram send error for ${chatId}:`,
+        error.response?.data || error.message
+      );
     }
   }
 }
 
-function detectChange(file, previous, removed) {
+function detectChange(file, removed) {
   if (removed) return "файл удалён или доступ к нему потерян";
   if (file.trashed) return "файл перемещён в корзину";
 
-  if (!previous) {
-    const created = new Date(file.createdTime).getTime();
-    const modified = new Date(file.modifiedTime).getTime();
-    if (Math.abs(modified - created) < 10000) return "создан новый файл";
-    return "обновлён файл";
+  const created = new Date(file.createdTime).getTime();
+  const modified = new Date(file.modifiedTime).getTime();
+
+  if (Math.abs(modified - created) < 15000) {
+    return "создан новый файл";
   }
 
-  const changes = [];
-
-  if (previous.name !== file.name) changes.push("изменено название");
-  if (previous.mimeType !== file.mimeType) changes.push("изменён тип файла");
-  if (previous.trashed !== file.trashed) changes.push("изменён статус корзины");
-  if (previous.modifiedTime !== file.modifiedTime) changes.push("изменено содержимое или метаданные");
-
-  return changes.length ? changes.join(", ") : "обновлён файл";
+  return "обновлён файл";
 }
 
 async function initPageToken() {
@@ -106,6 +121,7 @@ async function watchDriveChanges() {
       id: uuidv4(),
       type: "web_hook",
       address: PUBLIC_WEBHOOK_URL,
+      token: GOOGLE_CHANNEL_TOKEN,
       expiration: Date.now() + 6 * 24 * 60 * 60 * 1000
     }
   });
@@ -114,58 +130,80 @@ async function watchDriveChanges() {
 }
 
 async function processDriveChanges() {
-  if (!pageToken) await initPageToken();
+  if (isProcessing) {
+    console.log("Already processing, skipping duplicate webhook");
+    return;
+  }
 
-  let currentToken = pageToken;
+  isProcessing = true;
 
-  while (currentToken) {
-    const res = await drive.changes.list({
-      pageToken: currentToken,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-      fields:
-        "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed))"
-    });
+  try {
+    if (!pageToken) await initPageToken();
 
-    for (const change of res.data.changes || []) {
-      const file = change.file;
-      const previous = knownFiles.get(change.fileId);
+    let currentToken = pageToken;
 
-      if (change.removed || !file) {
-        await sendTelegram(
-          `🗑 <b>Google Drive: изменение</b>\n\n` +
-          `Что изменилось: файл удалён или доступ потерян\n` +
-          `File ID: <code>${escapeHtml(change.fileId)}</code>`
-        );
-        knownFiles.delete(change.fileId);
-        continue;
-      }
-
-      const whatChanged = detectChange(file, previous, change.removed);
-
-      knownFiles.set(file.id, {
-        name: file.name,
-        mimeType: file.mimeType,
-        modifiedTime: file.modifiedTime,
-        trashed: file.trashed
+    while (currentToken) {
+      const res = await drive.changes.list({
+        pageToken: currentToken,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+        fields:
+          "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed))"
       });
 
-      await sendTelegram(
-        `📁 <b>Google Drive: изменение</b>\n\n` +
-        `Что изменилось: <b>${escapeHtml(whatChanged)}</b>\n` +
-        `Название: <b>${escapeHtml(file.name)}</b>\n` +
-        `Тип: <code>${escapeHtml(file.mimeType)}</code>\n` +
-        `Изменён: ${escapeHtml(file.modifiedTime || "неизвестно")}\n` +
-        `${file.webViewLink ? `Ссылка: ${file.webViewLink}` : ""}`
-      );
-    }
+      for (const change of res.data.changes || []) {
+        const file = change.file;
 
-    if (res.data.nextPageToken) {
-      currentToken = res.data.nextPageToken;
-    } else {
-      pageToken = res.data.newStartPageToken;
-      currentToken = null;
+        if (change.removed || !file) {
+          const deleteKey = `removed:${change.fileId}`;
+
+          if (processedEvents.has(deleteKey)) continue;
+          rememberEvent(deleteKey);
+
+          await sendTelegram(
+            `🗑 <b>Google Drive: изменение</b>\n\n` +
+            `Что изменилось: файл удалён или доступ потерян\n` +
+            `File ID: <code>${escapeHtml(change.fileId)}</code>`
+          );
+
+          continue;
+        }
+
+        if (file.mimeType === "application/vnd.google-apps.folder") {
+          console.log("Folder ignored:", file.name);
+          continue;
+        }
+
+        const eventKey = `${file.id}:${file.modifiedTime}:${file.trashed}`;
+
+        if (processedEvents.has(eventKey)) {
+          console.log("Duplicate ignored:", file.name);
+          continue;
+        }
+
+        rememberEvent(eventKey);
+
+        const whatChanged = detectChange(file, change.removed);
+
+        await sendTelegram(
+          `📄 <b>Google Drive: изменение</b>\n\n` +
+          `Что изменилось: <b>${escapeHtml(whatChanged)}</b>\n` +
+          `Название: <b>${escapeHtml(file.name)}</b>\n` +
+          `Тип: <code>${escapeHtml(file.mimeType)}</code>\n` +
+          `Изменён: ${escapeHtml(file.modifiedTime || "неизвестно")}\n` +
+          `${file.webViewLink ? `Ссылка: ${file.webViewLink}` : ""}`
+        );
+      }
+
+      if (res.data.nextPageToken) {
+        currentToken = res.data.nextPageToken;
+      } else {
+        pageToken = res.data.newStartPageToken;
+        currentToken = null;
+      }
     }
+  } finally {
+    isProcessing = false;
   }
 }
 
@@ -184,9 +222,16 @@ app.get("/setup-watch", async (req, res) => {
 });
 
 app.post("/google-drive-webhook", async (req, res) => {
+  const token = req.header("X-Goog-Channel-Token");
+  const state = req.header("X-Goog-Resource-State");
+
+  if (GOOGLE_CHANNEL_TOKEN && token !== GOOGLE_CHANNEL_TOKEN) {
+    console.log("Old or invalid webhook ignored");
+    return res.sendStatus(204);
+  }
+
   res.sendStatus(204);
 
-  const state = req.header("X-Goog-Resource-State");
   console.log("Webhook received:", state);
 
   if (state === "sync") return;
@@ -194,7 +239,10 @@ app.post("/google-drive-webhook", async (req, res) => {
   try {
     await processDriveChanges();
   } catch (error) {
-    console.error("Webhook processing error:", error.response?.data || error.message);
+    console.error(
+      "Webhook processing error:",
+      error.response?.data || error.message
+    );
   }
 });
 
