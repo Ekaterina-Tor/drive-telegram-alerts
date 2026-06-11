@@ -22,6 +22,25 @@ const {
   PORT
 } = process.env;
 
+const PRICE_KEYWORDS = [
+  "price",
+  "prices",
+  "pricing",
+  "rate",
+  "rates",
+  "cost",
+  "прайс",
+  "прайсы",
+  "цена",
+  "цены",
+  "тариф",
+  "тарифы",
+  "стоимость",
+  "расценки"
+];
+
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
 const oauth2Client = new google.auth.OAuth2(
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET
@@ -37,17 +56,15 @@ let pageToken = null;
 let isProcessing = false;
 
 const processedEvents = new Set();
+const allowedFolderIds = new Set();
 
 function rememberEvent(key) {
   processedEvents.add(key);
-
-  setTimeout(() => {
-    processedEvents.delete(key);
-  }, 24 * 60 * 60 * 1000);
+  setTimeout(() => processedEvents.delete(key), 24 * 60 * 60 * 1000);
 }
 
 function escapeHtml(text = "") {
-  return String(text).replace(/[&<>"']/g, (c) => ({
+  return String(text).replace(/[&<>"']/g, c => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -58,12 +75,8 @@ function escapeHtml(text = "") {
 
 function getTelegramChatIds() {
   if (TELEGRAM_CHAT_IDS) {
-    return TELEGRAM_CHAT_IDS
-      .split(",")
-      .map((id) => id.trim())
-      .filter(Boolean);
+    return TELEGRAM_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean);
   }
-
   return [TELEGRAM_CHAT_ID].filter(Boolean);
 }
 
@@ -80,26 +93,67 @@ async function sendTelegram(message) {
         }
       );
     } catch (error) {
-      console.error(
-        `Telegram send error for ${chatId}:`,
-        error.response?.data || error.message
-      );
+      console.error(`Telegram send error for ${chatId}:`, error.response?.data || error.message);
     }
   }
 }
 
-function detectChange(file, removed) {
-  if (removed) return "файл удалён или доступ к нему потерян";
-  if (file.trashed) return "файл перемещён в корзину";
+function isPriceFile(file) {
+  const name = (file.name || "").toLowerCase();
+  return PRICE_KEYWORDS.some(keyword => name.includes(keyword));
+}
 
-  const created = new Date(file.createdTime).getTime();
-  const modified = new Date(file.modifiedTime).getTime();
+function isInsideTargetFolder(file) {
+  if (!TARGET_FOLDER_ID) return true;
+  if (!file.parents || !file.parents.length) return false;
 
-  if (Math.abs(modified - created) < 15000) {
-    return "создан новый файл";
+  return file.parents.some(parentId => allowedFolderIds.has(parentId));
+}
+
+async function loadAllowedFolders() {
+  allowedFolderIds.clear();
+
+  if (!TARGET_FOLDER_ID) {
+    console.log("TARGET_FOLDER_ID is not set. Watching all accessible Drive.");
+    return;
   }
 
-  return "обновлён файл";
+  allowedFolderIds.add(TARGET_FOLDER_ID);
+
+  let pageTokenFolders = null;
+
+  do {
+    const foldersToSearch = Array.from(allowedFolderIds);
+    let foundNewFolder = false;
+
+    for (const folderId of foldersToSearch) {
+      let nextPageToken = null;
+
+      do {
+        const res = await drive.files.list({
+          q: `'${folderId}' in parents and mimeType = '${FOLDER_MIME}' and trashed = false`,
+          fields: "nextPageToken,files(id,name)",
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          pageToken: nextPageToken || undefined
+        });
+
+        for (const folder of res.data.files || []) {
+          if (!allowedFolderIds.has(folder.id)) {
+            allowedFolderIds.add(folder.id);
+            foundNewFolder = true;
+            console.log("Allowed subfolder added:", folder.name);
+          }
+        }
+
+        nextPageToken = res.data.nextPageToken;
+      } while (nextPageToken);
+    }
+
+    pageTokenFolders = foundNewFolder ? "continue" : null;
+  } while (pageTokenFolders);
+
+  console.log(`Allowed folders loaded: ${allowedFolderIds.size}`);
 }
 
 async function initPageToken() {
@@ -130,6 +184,17 @@ async function watchDriveChanges() {
   console.log("Drive watch created:", res.data.id);
 }
 
+function getChangeText(file) {
+  const created = new Date(file.createdTime).getTime();
+  const modified = new Date(file.modifiedTime).getTime();
+
+  if (Math.abs(modified - created) < 15000) {
+    return "появился новый файл с ценами";
+  }
+
+  return "обновлён файл с ценами";
+}
+
 async function processDriveChanges() {
   if (isProcessing) {
     console.log("Already processing, skipping duplicate webhook");
@@ -156,32 +221,30 @@ async function processDriveChanges() {
         const file = change.file;
 
         if (change.removed || !file) {
-          const deleteKey = `removed:${change.fileId}`;
-
-          if (processedEvents.has(deleteKey)) continue;
-          rememberEvent(deleteKey);
-
-          await sendTelegram(
-            `🗑 <b>Google Drive: изменение</b>\n\n` +
-            `Что изменилось: файл удалён или доступ потерян\n` +
-            `File ID: <code>${escapeHtml(change.fileId)}</code>`
-          );
-
           continue;
         }
 
-        if (file.mimeType === "application/vnd.google-apps.folder") {
-          console.log("Folder ignored:", file.name);
+        if (file.trashed) {
           continue;
         }
 
-        if (
-    TARGET_FOLDER_ID &&
-    (!file.parents || !file.parents.includes(TARGET_FOLDER_ID))
-  ) {
-    console.log("Outside target folder ignored:", file.name);
-    continue;
-  }
+        if (file.mimeType === FOLDER_MIME) {
+          if (isInsideTargetFolder(file)) {
+            allowedFolderIds.add(file.id);
+            console.log("New subfolder detected:", file.name);
+          }
+          continue;
+        }
+
+        if (!isInsideTargetFolder(file)) {
+          console.log("Outside target folder ignored:", file.name);
+          continue;
+        }
+
+        if (!isPriceFile(file)) {
+          console.log("Not a price file ignored:", file.name);
+          continue;
+        }
 
         const eventKey = `${file.id}:${file.modifiedTime}:${file.trashed}`;
 
@@ -192,11 +255,9 @@ async function processDriveChanges() {
 
         rememberEvent(eventKey);
 
-        const whatChanged = detectChange(file, change.removed);
-
         await sendTelegram(
-          `📄 <b>Google Drive: изменение</b>\n\n` +
-          `Что изменилось: <b>${escapeHtml(whatChanged)}</b>\n` +
+          `💰 <b>Google Drive: цены</b>\n\n` +
+          `Что изменилось: <b>${escapeHtml(getChangeText(file))}</b>\n` +
           `Название: <b>${escapeHtml(file.name)}</b>\n` +
           `Тип: <code>${escapeHtml(file.mimeType)}</code>\n` +
           `Изменён: ${escapeHtml(file.modifiedTime || "неизвестно")}\n` +
@@ -225,7 +286,13 @@ app.get("/test-telegram", async (req, res) => {
   res.send("Telegram test sent");
 });
 
+app.get("/reload-folders", async (req, res) => {
+  await loadAllowedFolders();
+  res.send(`Folders reloaded: ${allowedFolderIds.size}`);
+});
+
 app.get("/setup-watch", async (req, res) => {
+  await loadAllowedFolders();
   await watchDriveChanges();
   res.send("Google Drive watch created");
 });
@@ -248,10 +315,7 @@ app.post("/google-drive-webhook", async (req, res) => {
   try {
     await processDriveChanges();
   } catch (error) {
-    console.error(
-      "Webhook processing error:",
-      error.response?.data || error.message
-    );
+    console.error("Webhook processing error:", error.response?.data || error.message);
   }
 });
 
@@ -260,8 +324,10 @@ const port = PORT || 3000;
 app.listen(port, async () => {
   console.log(`Server started on ${port}`);
 
+  await loadAllowedFolders();
   await initPageToken();
   await watchDriveChanges();
 
   setInterval(watchDriveChanges, 6 * 24 * 60 * 60 * 1000);
+  setInterval(loadAllowedFolders, 60 * 60 * 1000);
 });
