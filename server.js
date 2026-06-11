@@ -7,74 +7,194 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
+app.use(express.json());
+
+const {
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REFRESH_TOKEN,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
+  PUBLIC_WEBHOOK_URL,
+  PORT
+} = process.env;
 
 const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET
 );
 
 oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+  refresh_token: GOOGLE_REFRESH_TOKEN
 });
 
-const drive = google.drive({
-  version: "v3",
-  auth: oauth2Client,
-});
+const drive = google.drive({ version: "v3", auth: oauth2Client });
 
 let pageToken = null;
+const knownFiles = new Map();
 
-async function sendTelegram(text) {
+function escapeHtml(text = "") {
+  return String(text).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
+  })[c]);
+}
+
+async function sendTelegram(message) {
   await axios.post(
-    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
     {
-      chat_id: process.env.TELEGRAM_CHAT_ID,
-      text,
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: "HTML",
+      disable_web_page_preview: false
     }
   );
 }
 
-async function initPageToken() {
-  const response = await drive.changes.getStartPageToken();
-  pageToken = response.data.startPageToken;
-  console.log("Start token:", pageToken);
+function detectChange(file, previous, removed) {
+  if (removed) return "файл удалён или доступ к нему потерян";
+  if (file.trashed) return "файл перемещён в корзину";
+
+  if (!previous) {
+    const created = new Date(file.createdTime).getTime();
+    const modified = new Date(file.modifiedTime).getTime();
+    if (Math.abs(modified - created) < 10000) return "создан новый файл";
+    return "обновлён файл";
+  }
+
+  const changes = [];
+
+  if (previous.name !== file.name) changes.push("изменено название");
+  if (previous.mimeType !== file.mimeType) changes.push("изменён тип файла");
+  if (previous.trashed !== file.trashed) changes.push("изменён статус корзины");
+  if (previous.modifiedTime !== file.modifiedTime) changes.push("изменено содержимое или метаданные");
+
+  return changes.length ? changes.join(", ") : "обновлён файл";
 }
 
-app.post("/google-drive-webhook", async (req, res) => {
-  res.sendStatus(200);
+async function initPageToken() {
+  const res = await drive.changes.getStartPageToken({
+    supportsAllDrives: true
+  });
 
-  try {
-    const changes = await drive.changes.list({
-      pageToken,
+  pageToken = res.data.startPageToken;
+  console.log("Start page token:", pageToken);
+}
+
+async function watchDriveChanges() {
+  if (!pageToken) await initPageToken();
+
+  const res = await drive.changes.watch({
+    pageToken,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    requestBody: {
+      id: uuidv4(),
+      type: "web_hook",
+      address: PUBLIC_WEBHOOK_URL,
+      expiration: Date.now() + 6 * 24 * 60 * 60 * 1000
+    }
+  });
+
+  console.log("Drive watch created:", res.data.id);
+}
+
+async function processDriveChanges() {
+  if (!pageToken) await initPageToken();
+
+  let currentToken = pageToken;
+
+  while (currentToken) {
+    const res = await drive.changes.list({
+      pageToken: currentToken,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
       fields:
-        "changes(fileId,file(name,webViewLink,modifiedTime)),newStartPageToken",
+        "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed))"
     });
 
-    for (const change of changes.data.changes || []) {
+    for (const change of res.data.changes || []) {
       const file = change.file;
+      const previous = knownFiles.get(change.fileId);
 
-      if (!file) continue;
+      if (change.removed || !file) {
+        await sendTelegram(
+          `🗑 <b>Google Drive: изменение</b>\n\n` +
+          `Что изменилось: файл удалён или доступ потерян\n` +
+          `File ID: <code>${escapeHtml(change.fileId)}</code>`
+        );
+        knownFiles.delete(change.fileId);
+        continue;
+      }
+
+      const whatChanged = detectChange(file, previous, change.removed);
+
+      knownFiles.set(file.id, {
+        name: file.name,
+        mimeType: file.mimeType,
+        modifiedTime: file.modifiedTime,
+        trashed: file.trashed
+      });
 
       await sendTelegram(
-        `📁 Изменение в Google Drive\n\n${file.name}\n${file.webViewLink || ""}`
+        `📁 <b>Google Drive: изменение</b>\n\n` +
+        `Что изменилось: <b>${escapeHtml(whatChanged)}</b>\n` +
+        `Название: <b>${escapeHtml(file.name)}</b>\n` +
+        `Тип: <code>${escapeHtml(file.mimeType)}</code>\n` +
+        `Изменён: ${escapeHtml(file.modifiedTime || "неизвестно")}\n` +
+        `${file.webViewLink ? `Ссылка: ${file.webViewLink}` : ""}`
       );
     }
 
-    if (changes.data.newStartPageToken) {
-      pageToken = changes.data.newStartPageToken;
+    if (res.data.nextPageToken) {
+      currentToken = res.data.nextPageToken;
+    } else {
+      pageToken = res.data.newStartPageToken;
+      currentToken = null;
     }
-  } catch (e) {
-    console.error(e);
+  }
+}
+
+app.get("/", (req, res) => {
+  res.send("Drive Telegram Alerts is running");
+});
+
+app.get("/test-telegram", async (req, res) => {
+  await sendTelegram("✅ Тестовое сообщение: бот подключён.");
+  res.send("Telegram test sent");
+});
+
+app.get("/setup-watch", async (req, res) => {
+  await watchDriveChanges();
+  res.send("Google Drive watch created");
+});
+
+app.post("/google-drive-webhook", async (req, res) => {
+  res.sendStatus(204);
+
+  const state = req.header("X-Goog-Resource-State");
+  console.log("Webhook received:", state);
+
+  if (state === "sync") return;
+
+  try {
+    await processDriveChanges();
+  } catch (error) {
+    console.error("Webhook processing error:", error.response?.data || error.message);
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("OK");
-});
-
-const port = process.env.PORT || 3000;
+const port = PORT || 3000;
 
 app.listen(port, async () => {
   console.log(`Server started on ${port}`);
+
   await initPageToken();
+  await watchDriveChanges();
+
+  setInterval(watchDriveChanges, 6 * 24 * 60 * 60 * 1000);
 });
